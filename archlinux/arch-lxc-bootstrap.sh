@@ -13,15 +13,31 @@ trap 'warn "Command failed at line $LINENO. See $LOG_FILE"' ERR
 
 [[ $EUID -eq 0 ]] || die 'Run as root.'
 [[ -f /etc/arch-release ]] || die 'Arch Linux only.'
-[[ -t 0 ]] || die 'Run interactively (a terminal is required for username and password prompts).'
+# An optional positional argument enables unattended username/password setup.
+# With no argument, retain the interactive username and password prompts.
+(( $# <= 1 )) || die 'Usage: arch-lxc-bootstrap.sh [developer-username]'
+if (( $# == 1 )); then
+  DEV_USER=$1
+  AUTO_PASSWORD=true
+else
+  [[ -t 0 ]] || die 'A terminal is required when no username argument is provided.'
+  AUTO_PASSWORD=false
+fi
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # The developer is REQUIRED: yay/makepkg must never run as root.
-while :; do
-  read -r -p 'Developer username: ' DEV_USER
-  [[ $DEV_USER =~ ^[a-z_][a-z0-9_-]*$ ]] && [[ $DEV_USER != root ]] && break
-  warn 'Use a lowercase Linux username (letters, digits, underscores or hyphens).'
-done
+valid_dev_user() {
+  [[ $1 =~ ^[a-z_][a-z0-9_-]*$ ]] && [[ $1 != root ]]
+}
+if [[ $AUTO_PASSWORD == true ]]; then
+  valid_dev_user "$DEV_USER" || die 'Invalid developer username. Use lowercase letters, digits, underscores or hyphens; not root.'
+else
+  while :; do
+    read -r -p 'Developer username: ' DEV_USER
+    valid_dev_user "$DEV_USER" && break
+    warn 'Use a lowercase Linux username (letters, digits, underscores or hyphens).'
+  done
+fi
 
 log 'Configure pacman for 15 parallel downloads'
 cp -n "$PACMAN_CONF" "$PACMAN_CONF.bootstrap.bak" || true
@@ -66,9 +82,16 @@ usermod -s /bin/zsh "$DEV_USER"
 DEV_HOME=$(getent passwd "$DEV_USER" | cut -d: -f6)
 [[ -d $DEV_HOME ]] || die "Home directory does not exist: $DEV_HOME"
 
-# passwd reads securely from the terminal; never store credentials in variables/logs.
-log "Set password for $DEV_USER (input not echoed)"
-passwd "$DEV_USER"
+if [[ $AUTO_PASSWORD == true ]]; then
+  # chpasswd reads stdin; credentials are not included in command arguments or logs.
+  warn 'Username-based passwords are predictable. Change this password immediately after provisioning.'
+  log "Set password for $DEV_USER from the supplied username (non-interactive)"
+  printf '%s:%s\n' "$DEV_USER" "$DEV_USER" | chpasswd
+else
+  # passwd reads securely from the terminal; never store credentials in variables/logs.
+  log "Set password for $DEV_USER (input not echoed)"
+  passwd "$DEV_USER"
+fi
 
 log 'Configure passwordless sudo and Docker group membership'
 getent group docker >/dev/null || groupadd docker
@@ -124,14 +147,25 @@ export NVM_DIR="$HOME/.nvm"
 # END arch-lxc-bootstrap
 ZSHCONFIG
 
+log 'Initialize OpenSSH server host keys'
+# Generate only missing host keys; existing SSH server identities are preserved.
+ssh-keygen -A
+
 if [[ -e /run/systemd/system ]]; then
+  log 'Enable and start OpenSSH server (sshd) at boot'
+  systemctl enable --now sshd.service || warn 'sshd could not be enabled or started; inspect: journalctl -u sshd.service'
+
   log 'Enable Docker system service (root-only operation)'
   systemctl enable --now docker || warn 'Docker did not start. Proxmox LXC may need nesting/keyctl and suitable host settings.'
 else
-  warn 'systemd is unavailable; Docker daemon was installed but not started.'
+  warn 'systemd is unavailable; SSH and Docker were installed but their services were not enabled or started.'
 fi
 
 log 'Verify installations'
+if [[ -e /run/systemd/system ]]; then
+  systemctl is-enabled --quiet sshd.service || warn 'sshd is not enabled to start at boot.'
+  systemctl is-active --quiet sshd.service || warn 'sshd is not currently running.'
+fi
 as_dev yay --version
 as_dev python --version
 as_dev docker --version
