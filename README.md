@@ -1,1 +1,105 @@
-# Linux Utils
+# Generic Linux LXC development bootstrap
+
+`lxc-dev-bootstrap.sh` is a Bash bootstrap for **Debian, Ubuntu, Fedora, RHEL, CentOS Stream, Rocky Linux, AlmaLinux, openSUSE Leap/Tumbleweed and Arch Linux** LXC guests. Recognized derivatives are best-effort; only install on a freshly provisioned, trusted container or VM after taking a snapshot.
+
+It generalizes [`archlinux/arch-lxc-bootstrap.sh`](https://github.com/wallsarsh/linux-utils/blob/main/archlinux/arch-lxc-bootstrap.sh) without replacing it. Unlike the Arch predecessor, the default setup **does not install `yay` or assign the username as the password**.
+
+## What it installs and configures
+
+- OS package refresh/update, and optional Arch reflector mirror tuning; Arch `ParallelDownloads=15` (backups made).
+- Common build/development utilities: Git, compiler/make, Python 3/pip, Go, curl/wget, Zip/Unzip, editors and OpenSSH.
+- A non-root developer account with Zsh as login shell and family-specific `sudo`/`wheel` membership when available.
+- Developer-local Oh My Zsh, Zsh autosuggestions, and NVM (pinned to `v0.40.8` by default); re-runs preserve unrelated `.zshrc` content.
+- Docker Engine and **Compose V2**; account added to the `docker` group; services enabled/started when systemd runs.
+- Optional public-key SSH access, secure password input from stdin, or interactive `passwd` (when prompted for username).
+- Root-operated package management; user-owned shell customization. Optional Arch `yay` is explicitly opt-in and `makepkg` runs as the developer.
+- Logging in `/var/log/lxc-dev-bootstrap.log`; package/install errors fail the run, but service activation failures are warned about (typical with unconfigured nested LXC).
+
+## Usage
+
+Run as root **inside the LXC guest** (not on the Proxmox host):
+
+```bash
+chmod +x lxc-dev-bootstrap.sh
+sudo ./lxc-dev-bootstrap.sh
+```
+
+The above prompts for a developer username and password when invoked interactively with a TTY. With a positional username or `--user NAME`, the invocation is **unattended**. A newly created account will have a **locked password** unless you supply a password or SSH key. Existing accounts keep their current password when no password is supplied.
+
+**SSH-key-based unattended bootstrap:**
+
+```bash
+sudo ./lxc-dev-bootstrap.sh --user dev --ssh-key-file /root/dev.pub
+```
+
+**Password passed securely over stdin:**
+
+```bash
+# Execute in a root shell, or use a secure secret-manager command producing one line.
+read -rsp 'New password: ' DEV_PASSWORD; echo
+printf '%s\n' "$DEV_PASSWORD" | sudo ./lxc-dev-bootstrap.sh --user dev --password-stdin
+unset DEV_PASSWORD
+```
+
+**Conservative test run without Docker services or an OS upgrade** (Arch requires an upgrade and rejects `--no-upgrade`):
+
+```bash
+sudo ./lxc-dev-bootstrap.sh --user dev --no-docker --no-services --no-upgrade
+```
+
+**Arch with the optional AUR helper:**
+
+```bash
+sudo ./lxc-dev-bootstrap.sh --user dev --arch-yay --no-arch-mirrors
+```
+
+**Password-required sudo:**
+
+```bash
+sudo ./lxc-dev-bootstrap.sh --user dev --sudo-mode password --ssh-key-file /root/dev.pub
+```
+
+`--sudo-mode password` makes `sudo` require the account's own password, so set it via `passwd dev` before using sudo unless it already exists. The default `nopasswd` retains the original script's convenience and has equivalent-to-root implications.
+
+## Distribution handling
+
+| Family | Update action | Docker setup (`--docker-source auto`) | OpenSSH unit |
+|---|---|---|---|
+| Debian / Ubuntu | `apt-get update` and `upgrade` | Docker's official APT repository and Compose plugin | `ssh.service` (or `sshd.service`) |
+| Fedora / RHEL / CentOS Stream / Rocky / AlmaLinux | DNF/YUM upgrade | Docker's official RPM repository; Rocky/Alma map to CentOS repo | `sshd.service` (or `ssh.service`) |
+| openSUSE Leap | `zypper refresh`, `update` | SUSE `docker` + `docker-compose` packages | `sshd.service` (or `ssh.service`) |
+| openSUSE Tumbleweed | `zypper refresh`, `dup` | SUSE `docker` + `docker-compose` packages | `sshd.service` (or `ssh.service`) |
+| Arch Linux | Pacman keyring, full system upgrade; optional reflector | Official `docker` + `docker-compose` packages (no AUR required) | `sshd.service` (or `ssh.service`) |
+
+`--docker-source distro` explicitly uses the distro-maintained packages. On certain Debian/RHEL derivatives, no Compose V2 package may be available: the script will stop with an actionable error instead of installing obsolete Compose V1. `--docker-source official` is restricted to recognized supported distribution mappings, to avoid silently using an incorrect repo on derivatives.
+
+Docker Engine official packages can conflict with existing `docker.io`, Podman compatibility packages, or container runtimes; **this script does not uninstall existing software**. Investigate conflicts on an already customized guest before proceeding. RHEL requires a working registered subscription/repository configuration for base packages.
+
+## Important LXC, operational and security notes
+
+1. Docker-in-LXC **depends on the host**. In Proxmox, nesting and suitable keyctl, storage, cgroups, security policy and host kernel features may be needed. The script cannot configure the Proxmox host. It verifies Docker CLI and Compose, but it does not run containers or claim the Docker daemon is functional. Check `systemctl status docker` and `docker info` yourself after provisioning.
+2. It works when systemd is not running but does not start persistent services; startup responsibility belongs to your image/init configuration. Verify that SSH is accessible and firewall/network settings permit access. It generates only missing SSH host keys.
+3. The default `NOPASSWD` sudo rule and membership of the `docker` group permit root-equivalent actions. Use only for trusted development users.
+4. The official Docker repositories are third-party repositories over TLS with package-signature validation. Arch `yay` builds from the AUR (user code) and is deliberately opt-in with `--arch-yay`.
+5. Do **not** use the unmaintained or incompatible distributions as a production support claim. OS/package support varies by release. Derivatives recognized through `ID_LIKE` use their family package manager, but some package names/repos may need local adjustment.
+6. The script is **idempotent on routine reruns**: it avoids recreating users and Git checkouts, reuses existing repository files, preserves existing SSH host keys, deduplicates inserted public keys, and replaces only its own `.zshrc` block. It is not transactional: failures can leave partial installed packages or repo configuration; take a Proxmox snapshot before running.
+7. To review the log, run `sudo less /var/log/lxc-dev-bootstrap.log` (permissions `0600`). A supplied password is never printed by the script.
+
+The script does not harden SSH daemon config, set up firewall rules, install a Node.js runtime (only NVM), run full container smoke tests, or configure Docker's rootless mode.
+
+## Validation
+
+```bash
+bash -n lxc-dev-bootstrap.sh
+python3 test_lxc_dev_bootstrap.py
+```
+
+The included Python tests use mocked package managers. They validate OS recognition, package mappings, upgrade commands and Docker-repository selection without modifying the system. These tests **do not** replace disposable LXC integration testing on each specific supported distribution/release.
+
+### Reference documentation
+
+- Docker Engine: [Ubuntu](https://docs.docker.com/engine/install/ubuntu/), [Debian](https://docs.docker.com/engine/install/debian/), [RHEL](https://docs.docker.com/engine/install/rhel/), [Fedora](https://docs.docker.com/engine/install/fedora/), [CentOS](https://docs.docker.com/engine/install/centos/)
+- [Docker Compose plugin](https://docs.docker.com/compose/install/linux/), [Docker group security](https://docs.docker.com/engine/install/linux-postinstall/)
+- [openSUSE Tumbleweed updates](https://doc.opensuse.org/documentation/tumbleweed/updating_upgrading_reverting/)
+- [Arch partial-upgrade guidance](https://wiki.archlinux.org/title/System_maintenance)
+- [NVM releases](https://github.com/nvm-sh/nvm/releases)
