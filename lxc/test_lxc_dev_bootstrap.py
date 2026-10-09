@@ -23,16 +23,24 @@ class BootstrapTests(unittest.TestCase):
             path = self.stub / name
             path.write_text('#!/bin/sh\nprintf "%s %s\\n" "$(basename "$0")" "$*" >> "$CMD_LOG"\n')
             path.chmod(0o755)
+        # A fake dynamic-linker cache tracks an initially installed runtime or
+        # one supplied by the mocked package manager. Never modify the host.
+        loader = self.stub / 'ldconfig'
+        loader.write_text('#!/bin/sh\nprintf \'ldconfig %s\\n\' "$*" >> "$CMD_LOG"\n[ "${1:-}" = \'-p\' ] || exit 0\n[ "${ATOMIC_NO_PROVIDER:-false}" = true ] && exit 0\nif [ "${ATOMIC_PREINSTALLED:-false}" = true ] ||\n   grep -E \'^(apt-get|dnf|yum|zypper|pacman) .* (libatomic|libatomic1|gcc-libs)$\' "$CMD_LOG" >/dev/null 2>&1; then\n  printf \'  libatomic.so.1 (libc6,x86-64) => /lib64/libatomic.so.1\\n\'\nfi\n')
+        loader.chmod(0o755)
         self.source = self.root / 'lib.sh'
         self.source.write_text(SOURCE)
         self.os_release = self.root / 'os-release'
 
-    def run_bash(self, code, *, distro='debian', like='', version='12', upgrade=True):
+    def run_bash(self, code, *, distro='debian', like='', version='12', upgrade=True,
+                 atomic_preinstalled=False, atomic_no_provider=False):
         self.os_release.write_text(f'ID={distro}\nID_LIKE="{like}"\nVERSION_ID="{version}"\nVERSION_CODENAME=bookworm\nPRETTY_NAME="Test {distro}"\n')
         env = os.environ.copy()
         env.update({
             'OS_RELEASE_FILE': str(self.os_release),
             'CMD_LOG': str(self.log),
+            'ATOMIC_PREINSTALLED': str(atomic_preinstalled).lower(),
+            'ATOMIC_NO_PROVIDER': str(atomic_no_provider).lower(),
             'PATH': str(self.stub) + os.pathsep + env['PATH'],
         })
         result = subprocess.run(
@@ -163,6 +171,104 @@ class BootstrapTests(unittest.TestCase):
         p = self.run_bash('INSTALL_YAY=true; detect_os', distro='ubuntu')
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('only on Arch', p.stderr)
+
+    def test_as_dev_changes_from_inaccessible_root_cwd(self):
+        """Regression: child user must not inherit a root-only cwd."""
+        import pwd
+        if os.geteuid() != 0:
+            self.skipTest('Real UID switching requires root')
+        try:
+            pwd.getpwnam('nobody')
+        except KeyError:
+            self.skipTest('System has no nobody account')
+        private_cwd = self.root / 'root-private'
+        private_cwd.mkdir(mode=0o700)
+        p = subprocess.run(
+            ['bash', '-c', '''source "$1"
+                DEV_USER=nobody
+                DEV_HOME=/tmp
+                cd -- "$2"
+                before=$PWD
+                as_dev bash -c 'test "$PWD" = "$HOME" && stat . >/dev/null'
+                test "$PWD" = "$before"
+            ''', '_', str(self.source), str(private_cwd)],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_as_dev_go_version_from_inaccessible_root_cwd(self):
+        """Integration regression for Go 'stat .' failing after runuser."""
+        import pwd
+        import shutil
+        if os.geteuid() != 0:
+            self.skipTest('Real UID switching requires root')
+        if shutil.which('go') is None:
+            self.skipTest('Go is not installed on test host')
+        try:
+            pwd.getpwnam('nobody')
+        except KeyError:
+            self.skipTest('System has no nobody account')
+        private_cwd = self.root / 'private-go'
+        private_cwd.mkdir(mode=0o700)
+        p = subprocess.run(
+            ['bash', '-c', '''source "$1"
+                DEV_USER=nobody
+                DEV_HOME=/tmp
+                cd -- "$2"
+                as_dev go version
+            ''', '_', str(self.source), str(private_cwd)],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('go version', p.stdout)
+
+    def test_libatomic_distro_mapping_when_missing(self):
+        for distro, package in [
+            ('almalinux', 'libatomic'),
+            ('rhel', 'libatomic'),
+            ('rocky', 'libatomic'),
+            ('fedora', 'libatomic'),
+            ('centos', 'libatomic'),
+            ('ubuntu', 'libatomic1'),
+            ('debian', 'libatomic1'),
+            ('opensuse-leap', 'libatomic1'),
+            ('opensuse-tumbleweed', 'libatomic1'),
+            ('arch', 'libatomic'),
+        ]:
+            with self.subTest(distro=distro):
+                self.log.unlink(missing_ok=True)
+                p = self.run_bash('detect_os; install_node_runtime_deps', distro=distro)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                commands = self.log.read_text()
+                self.assertIn(' install ' if distro != 'arch' else 'pacman -S ', commands)
+                self.assertIn(package, commands)
+                self.assertIn('ldconfig -p', commands)
+                self.assertIn('ldconfig \n', commands)
+
+    def test_libatomic_already_available_skips_package_install(self):
+        self.log.unlink(missing_ok=True)
+        p = self.run_bash('detect_os; install_node_runtime_deps', distro='almalinux', atomic_preinstalled=True)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn('dnf -y install', self.log.read_text())
+        self.assertIn('no additional package required', p.stdout)
+
+    def test_libatomic_legacy_arch_falls_back_to_gcc_libs(self):
+        self.log.unlink(missing_ok=True)
+        p = self.run_bash('detect_os; pkg_has() { return 1; }; install_node_runtime_deps', distro='arch')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('pacman -S --needed --noconfirm gcc-libs', self.log.read_text())
+
+    def test_libatomic_unavailable_after_install_fails_loudly(self):
+        self.log.unlink(missing_ok=True)
+        p = self.run_bash('detect_os; install_node_runtime_deps', distro='almalinux', atomic_no_provider=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('still missing after installing libatomic', p.stderr)
+
+    def test_libatomic_setup_precedes_nvm_and_user_config(self):
+        script = SCRIPT.read_text()
+        main = script.split('main() {', 1)[1]
+        self.assertLess(main.index('install_tools\n'), main.index('install_node_runtime_deps\n'))
+        self.assertLess(main.index('install_node_runtime_deps\n'), main.index('setup_user_shell\n'))
 
     def test_no_password_leak_into_log_option(self):
         p = subprocess.run([str(SCRIPT), '--help'], text=True, capture_output=True)

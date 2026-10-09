@@ -255,6 +255,39 @@ install_tools() {
   command -v visudo >/dev/null 2>&1 || die 'visudo is required.'
 }
 
+# NVM installs upstream Node.js binaries, which can dynamically require
+# libatomic.so.1. Minimal LXC images (notably AlmaLinux/RHEL-family) may lack it.
+# Avoid pulling in extra packages when the correct runtime is already present.
+libatomic_available() {
+  command -v ldconfig >/dev/null 2>&1 || return 1
+  ldconfig -p 2>/dev/null | grep -E '^[[:space:]]*libatomic\.so\.1[[:space:]]+\(' >/dev/null
+}
+
+install_node_runtime_deps() {
+  log 'Ensure GNU libatomic runtime is available for NVM-managed Node.js'
+  if libatomic_available; then
+    log 'libatomic.so.1 is already available; no additional package required'
+    return 0
+  fi
+
+  local atomic_pkg
+  case "$FAMILY" in
+    redhat) atomic_pkg=libatomic ;;
+    debian|suse) atomic_pkg=libatomic1 ;;
+    arch)
+      # Arch recently split libatomic from gcc-libs. Support older mirrors too.
+      if pkg_has libatomic; then atomic_pkg=libatomic
+      else atomic_pkg=gcc-libs; fi ;;
+    *) die "No libatomic package mapping for $FAMILY" ;;
+  esac
+
+  log "Install Node.js runtime dependency: $atomic_pkg"
+  pkg_install "$atomic_pkg"
+  command -v ldconfig >/dev/null 2>&1 || die 'ldconfig unavailable: cannot verify libatomic.so.1'
+  ldconfig
+  libatomic_available || die "libatomic.so.1 still missing after installing $atomic_pkg; inspect package repositories and linker configuration."
+}
+
 setup_apt_docker_repo() {
   local flavor=$1 codename arch tmp
   # Docker's official apt repositories are distribution/codename-specific.
@@ -343,9 +376,13 @@ install_docker() {
   docker compose version >/dev/null 2>&1 || die 'Docker Compose V2 is unavailable after installation.'
 }
 
-as_dev() {
+# runuser inherits the caller's working directory (e.g., private /root).
+# Enter the developer home before switching UID; the subshell preserves the
+# calling shell's working directory for subsequent root-only operations.
+as_dev() (
+  cd -- "$DEV_HOME" || return 1
   runuser -u "$DEV_USER" -- env HOME="$DEV_HOME" USER="$DEV_USER" LOGNAME="$DEV_USER" "$@"
-}
+)
 
 setup_account() {
   log "Configure developer account: $DEV_USER"
@@ -523,6 +560,7 @@ main() {
   upgrade_system
   refresh_arch_mirrors
   install_tools
+  install_node_runtime_deps
   install_docker
   setup_account
   install_arch_yay

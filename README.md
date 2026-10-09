@@ -10,6 +10,7 @@ It generalizes [`archlinux/arch-lxc-bootstrap.sh`](https://github.com/wallsarsh/
 - Common build/development utilities: Git, compiler/make, Python 3/pip, Go, curl/wget, Zip/Unzip, editors and OpenSSH.
 - A non-root developer account with Zsh as login shell and family-specific `sudo`/`wheel` membership when available.
 - Developer-local Oh My Zsh, Zsh autosuggestions, and NVM (pinned to `v0.40.8` by default); re-runs preserve unrelated `.zshrc` content.
+- NVM-managed Node.js runtime prerequisite: detect `libatomic.so.1` via `ldconfig -p` and install the distribution-appropriate GCC atomic library package only when absent.
 - Docker Engine and **Compose V2**; account added to the `docker` group; services enabled/started when systemd runs.
 - Optional public-key SSH access, secure password input from stdin, or interactive `passwd` (when prompted for username).
 - Root-operated package management; user-owned shell customization. Optional Arch `yay` is explicitly opt-in and `makepkg` runs as the developer.
@@ -75,6 +76,39 @@ sudo ./lxc-dev-bootstrap.sh --user dev --sudo-mode password --ssh-key-file /root
 
 Docker Engine official packages can conflict with existing `docker.io`, Podman compatibility packages, or container runtimes; **this script does not uninstall existing software**. Investigate conflicts on an already customized guest before proceeding. RHEL requires a working registered subscription/repository configuration for base packages.
 
+## NVM and Node.js: `libatomic.so.1` runtime dependency
+
+**Why:** NVM downloads official prebuilt Node.js executables; depending on the Node.js release and target system, they may link dynamically against `libatomic.so.1`. Minimal LXC images (especially AlmaLinux/RHEL-like images) may not include this library. A download via `nvm install` may succeed while launching `node` fails with:
+
+```text
+node: error while loading shared libraries: libatomic.so.1: cannot open shared object file: No such file or directory
+```
+
+**Bootstrap change:** After common development tools are installed and **before** the developer's NVM setup, `install_node_runtime_deps` checks `ldconfig -p` for `libatomic.so.1`. If absent, it installs the appropriate distro runtime and rechecks. On Arch, it prefers the newer standalone `libatomic` package when it is in repository metadata, otherwise it falls back to `gcc-libs` for older layouts. If the runtime is still not available, bootstrap exits with an actionable error rather than reporting success. No extra package transaction is made when the runtime is already available.
+
+| Family | Package when `libatomic.so.1` is missing |
+|---|---|
+| RHEL / AlmaLinux / Rocky / Fedora / CentOS Stream | `libatomic` |
+| Debian / Ubuntu | `libatomic1` |
+| openSUSE Leap / Tumbleweed | `libatomic1` |
+| Arch Linux | `libatomic` (newer package layout); `gcc-libs` fallback |
+
+**Fix an already provisioned AlmaLinux guest without rerunning bootstrap:**
+
+```bash
+# As root (or using sudo)
+sudo dnf install -y libatomic
+ldconfig -p | grep libatomic.so.1
+
+# As the developer (with NVM loaded by ~/.zshrc)
+nvm install --lts
+node --version
+```
+
+You can also rerun the updated bootstrap with your existing username, e.g. `sudo ./lxc-dev-bootstrap.sh --user dev --no-upgrade`; it will make this dependency check without reinstalling a developer account. `--no-upgrade` is invalid on Arch.
+
+This ensures only the **atomic shared-library prerequisite**. The script installs NVM but does **not** automatically install a Node.js version. Other compatibility restrictions (such as an older glibc or an unsupported CPU architecture) remain possible; `libatomic` cannot fix those.
+
 ## Important LXC, operational and security notes
 
 1. Docker-in-LXC **depends on the host**. In Proxmox, nesting and suitable keyctl, storage, cgroups, security policy and host kernel features may be needed. The script cannot configure the Proxmox host. It verifies Docker CLI and Compose, but it does not run containers or claim the Docker daemon is functional. Check `systemctl status docker` and `docker info` yourself after provisioning.
@@ -85,7 +119,25 @@ Docker Engine official packages can conflict with existing `docker.io`, Podman c
 6. The script is **idempotent on routine reruns**: it avoids recreating users and Git checkouts, reuses existing repository files, preserves existing SSH host keys, deduplicates inserted public keys, and replaces only its own `.zshrc` block. It is not transactional: failures can leave partial installed packages or repo configuration; take a Proxmox snapshot before running.
 7. To review the log, run `sudo less /var/log/lxc-dev-bootstrap.log` (permissions `0600`). A supplied password is never printed by the script.
 
-The script does not harden SSH daemon config, set up firewall rules, install a Node.js runtime (only NVM), run full container smoke tests, or configure Docker's rootless mode.
+The script does not harden SSH daemon config, set up firewall rules, install a Node.js runtime (only NVM and the OS-level `libatomic` prerequisite), run full container smoke tests, or configure Docker's rootless mode.
+
+## Troubleshooting: `cannot determine current directory: stat .: permission denied`
+
+Earlier versions used `runuser` while retaining the root shell's working directory. If bootstrap was launched from `/root` or another protected directory, the developer account could not inspect `.`. During **Verify installation**, `go version` then failed even though Go itself was installed correctly.
+
+**Fixed:** `as_dev()` now changes to the developer's home in a subshell before invoking `runuser`, leaving the calling shell's working directory unchanged. This is a cross-distro fix, including AlmaLinux.
+
+For a previously completed installation, verify without repeating the package upgrade (replace `dev` with your actual username):
+
+```bash
+cd /home/dev
+sudo -u dev -- go version
+sudo -u dev -- docker compose version
+sudo -u dev -- sudo -n true
+sudo systemctl is-active sshd docker
+```
+
+If re-running, replace your old copy with the updated script and use the same username and options. User account configuration and shell customization are repeatable. A full rerun still refreshes and upgrades OS packages unless `--no-upgrade` is supplied (Arch does not support that flag).
 
 ## Validation
 
@@ -103,3 +155,6 @@ The included Python tests use mocked package managers. They validate OS recognit
 - [openSUSE Tumbleweed updates](https://doc.opensuse.org/documentation/tumbleweed/updating_upgrading_reverting/)
 - [Arch partial-upgrade guidance](https://wiki.archlinux.org/title/System_maintenance)
 - [NVM releases](https://github.com/nvm-sh/nvm/releases)
+- [AlmaLinux `libatomic` errata/package](https://errata.almalinux.org/9/ALSA-2025-1346.html), [Fedora `libatomic` package](https://packages.fedoraproject.org/pkgs/gcc/libatomic/)
+- [Debian `libatomic1`](https://packages.debian.org/libatomic1), [Ubuntu `libatomic1`](https://packages.ubuntu.com/libatomic1)
+- [Arch `libatomic`](https://archlinux.org/packages/core/x86_64/libatomic/), [Arch `gcc-libs`](https://archlinux.org/packages/core/x86_64/gcc-libs/)
